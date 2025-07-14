@@ -1,0 +1,226 @@
+// OPTIONAL: CLEANUP AFTER DEMO
+TRUNCATE TABLE SRC_DB.SRC_SCHEMA.COLUMN_PROFILE_AUDIT;
+TRUNCATE TABLE SRC_DB.SRC_SCHEMA.COLUMN_PROFILE_ERRORS;
+
+//Set the working schema to create the procedure
+
+USE DATABASE SRC_DB;
+USE SCHEMA SRC_SCHEMA;
+
+//Define stored procedure with 4 input parameters for source/target DB & schema
+
+-- Final Patched Column Profiling Procedure with MD5 Fix
+CREATE OR REPLACE PROCEDURE SP_COLUMN_PROFILE_MATCH_JS_1240(
+  SRC_DB STRING,
+  TGT_DB STRING,
+  SRC_SCHEMA STRING,
+  TGT_SCHEMA STRING
+)
+//Defines the scripting language used in the procedure (Snowflake supports JavaScript for SPs)
+
+RETURNS STRING
+LANGUAGE JAVASCRIPT
+AS
+//Captures missing tables/columns or failures and inserts into COLUMN_PROFILE_ERRORS table
+//Logs all stats like null counts, min/max values, lengths, row counts, and hash result into COLUMN_PROFILE_AUDIT
+$$
+function logError(table, col, msg, colType) {
+  snowflake.createStatement({
+    sqlText: `INSERT INTO ${SRC_DB}.${SRC_SCHEMA}.COLUMN_PROFILE_ERRORS
+              (TABLE_NAME, COLUMN_NAME, ERROR_MESSAGE, COL_TYPE, ERROR_TS)
+              VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP())`,
+    binds: [table, col, msg, colType]
+  }).execute();
+}
+
+function logAudit(obj) {
+  snowflake.createStatement({
+    sqlText: `INSERT INTO ${SRC_DB}.${SRC_SCHEMA}.COLUMN_PROFILE_AUDIT
+      (TABLE_NAME, COLUMN_NAME, SRC_NULL_COUNT, TGT_NULL_COUNT,
+       SRC_MIN_VAL, TGT_MIN_VAL, SRC_MAX_VAL, TGT_MAX_VAL,
+       SRC_MIN_LENGTH, TGT_MIN_LENGTH, SRC_MAX_LENGTH, TGT_MAX_LENGTH,
+       SRC_ROW_COUNT, TGT_ROW_COUNT, COL_HASH_MATCH,
+       STATUS, COMPARE_TS)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP())`,
+    binds: [
+      obj.tbl, obj.col, obj.sNull, obj.tNull,
+      obj.sMin, obj.tMin, obj.sMax, obj.tMax,
+      obj.sMinLen, obj.tMinLen, obj.sMaxLen, obj.tMaxLen,
+      obj.sRowCount, obj.tRowCount, obj.colHashMatch, obj.status
+    ]
+  }).execute();
+}
+
+var tables = snowflake.createStatement({
+  sqlText: `SELECT TABLE_NAME 
+            FROM ${SRC_DB}.INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_SCHEMA = UPPER(?) 
+              AND UPPER(TABLE_NAME) NOT IN ('COLUMN_PROFILE_AUDIT', 'COLUMN_PROFILE_ERRORS')`,
+  binds: [SRC_SCHEMA]
+}).execute();
+
+//Start collecting all tables from source schema to iterate and profile each one
+
+while (tables.next()) {
+  var tbl = tables.getColumnValue(1);
+
+  var tgtExists = snowflake.createStatement({
+    sqlText: `SELECT COUNT(*) 
+              FROM ${TGT_DB}.INFORMATION_SCHEMA.TABLES 
+              WHERE TABLE_SCHEMA = UPPER(?) AND TABLE_NAME = ?`,
+    binds: [TGT_SCHEMA, tbl]
+  }).execute();
+  tgtExists.next();
+  if (+tgtExists.getColumnValue(1) === 0) {
+    logError(tbl, null, 'Table missing in target', 'TABLE');
+    continue;
+  }
+
+  var sRowCount = 0, tRowCount = 0;
+  try {
+    var srcRC = snowflake.createStatement({
+      sqlText: `SELECT COUNT(*) FROM ${SRC_DB}.${SRC_SCHEMA}.${tbl}`
+    }).execute(); srcRC.next(); sRowCount = srcRC.getColumnValue(1);
+
+    var tgtRC = snowflake.createStatement({
+      sqlText: `SELECT COUNT(*) FROM ${TGT_DB}.${TGT_SCHEMA}.${tbl}`
+    }).execute(); tgtRC.next(); tRowCount = tgtRC.getColumnValue(1);
+  } catch (e) {
+    logError(tbl, null, `Row count error: ${e.message}`, 'ROW');
+  }
+
+  var cols = snowflake.createStatement({
+    sqlText: `SELECT COLUMN_NAME, DATA_TYPE 
+              FROM ${SRC_DB}.INFORMATION_SCHEMA.COLUMNS
+              WHERE TABLE_SCHEMA = UPPER(?) AND TABLE_NAME = ?`,
+    binds: [SRC_SCHEMA, tbl]
+  }).execute();
+
+  while (cols.next()) {
+    var col = cols.getColumnValue(1);
+    var dt = cols.getColumnValue(2).toUpperCase();
+
+    var colExists = snowflake.createStatement({
+      sqlText: `SELECT COUNT(*) 
+                FROM ${TGT_DB}.INFORMATION_SCHEMA.COLUMNS 
+                WHERE TABLE_SCHEMA = UPPER(?) AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+      binds: [TGT_SCHEMA, tbl, col]
+    }).execute();
+    colExists.next();
+    if (+colExists.getColumnValue(1) === 0) {
+      logError(tbl, col, 'Column missing in target', dt);
+      continue;
+    }
+
+    try {
+      var obj = {
+        tbl: tbl, col: col,
+        sNull: null, tNull: null,
+        sMin: null, tMin: null,
+        sMax: null, tMax: null,
+        sMinLen: null, tMinLen: null,
+        sMaxLen: null, tMaxLen: null,
+        sRowCount: sRowCount, tRowCount: tRowCount,
+        colHashMatch: 'NOT_ATTEMPTED',
+        status: 'MATCHED'
+      };
+
+      if (['NUMBER','DECIMAL','FLOAT','INT','INTEGER','BIGINT','DOUBLE'].includes(dt)) {
+        var srcStats = snowflake.createStatement({
+          sqlText: `SELECT COUNT_IF(${col} IS NULL), ROUND(MIN(${col})), ROUND(MAX(${col}))
+                    FROM ${SRC_DB}.${SRC_SCHEMA}.${tbl}`
+        }).execute();
+        srcStats.next();
+        obj.sNull = srcStats.getColumnValue(1);
+        obj.sMin = srcStats.getColumnValue(2);
+        obj.sMax = srcStats.getColumnValue(3);
+
+        var tgtStats = snowflake.createStatement({
+          sqlText: `SELECT COUNT_IF(${col} IS NULL), ROUND(MIN(${col})), ROUND(MAX(${col}))
+                    FROM ${TGT_DB}.${TGT_SCHEMA}.${tbl}`
+        }).execute();
+        tgtStats.next();
+        obj.tNull = tgtStats.getColumnValue(1);
+        obj.tMin = tgtStats.getColumnValue(2);
+        obj.tMax = tgtStats.getColumnValue(3);
+
+        if (obj.sNull !== obj.tNull || obj.sMin !== obj.tMin || obj.sMax !== obj.tMax) {
+          obj.status = 'MISMATCH';
+        }
+
+      } else if (dt === 'TEXT' || dt === 'VARCHAR') {
+        var srcStats = snowflake.createStatement({
+          sqlText: `SELECT COUNT_IF(${col} IS NULL), MIN(LENGTH(${col})), MAX(LENGTH(${col}))
+                    FROM ${SRC_DB}.${SRC_SCHEMA}.${tbl}`
+        }).execute();
+        srcStats.next();
+        obj.sNull = srcStats.getColumnValue(1);
+        obj.sMinLen = srcStats.getColumnValue(2);
+        obj.sMaxLen = srcStats.getColumnValue(3);
+
+        var tgtStats = snowflake.createStatement({
+          sqlText: `SELECT COUNT_IF(${col} IS NULL), MIN(LENGTH(${col})), MAX(LENGTH(${col}))
+                    FROM ${TGT_DB}.${TGT_SCHEMA}.${tbl}`
+        }).execute();
+        tgtStats.next();
+        obj.tNull = tgtStats.getColumnValue(1);
+        obj.tMinLen = tgtStats.getColumnValue(2);
+        obj.tMaxLen = tgtStats.getColumnValue(3);
+
+        if (obj.sNull !== obj.tNull || obj.sMinLen !== obj.tMinLen || obj.sMaxLen !== obj.tMaxLen) {
+          obj.status = 'MISMATCH';
+        }
+      } else {
+        logError(tbl, col, `Unsupported data type for profiling`, dt);
+        continue;
+      }
+
+      // Hash only if supported
+      if (!['FLOAT', 'DOUBLE'].includes(dt)) {
+        try {
+          var srcHashStmt = snowflake.createStatement({
+            sqlText: `SELECT MD5(TO_VARCHAR(ARRAY_TO_STRING(ARRAY_AGG(TO_VARCHAR(${col})), ','))) FROM ${SRC_DB}.${SRC_SCHEMA}.${tbl}`
+          }).execute();
+          var tgtHashStmt = snowflake.createStatement({
+            sqlText: `SELECT MD5(TO_VARCHAR(ARRAY_TO_STRING(ARRAY_AGG(TO_VARCHAR(${col})), ','))) FROM ${TGT_DB}.${TGT_SCHEMA}.${tbl}`
+          }).execute();
+
+          srcHashStmt.next(); tgtHashStmt.next();
+          var srcHash = srcHashStmt.getColumnValue(1);
+          var tgtHash = tgtHashStmt.getColumnValue(1);
+          
+//Profiling Logic
+
+          obj.colHashMatch = (srcHash === tgtHash) ? 'MATCHED' : 'MISMATCH';
+          if (obj.colHashMatch === 'MISMATCH') obj.status = 'MISMATCH';
+        } catch (errHash) {
+          logError(tbl, col, `Hash comparison error: ${errHash.message}`, dt);
+          obj.colHashMatch = 'ERROR';
+        }
+      } else {
+        logError(tbl, col, `Skipping hash comparison for unsupported type`, dt);
+      }
+
+      logAudit(obj);
+
+    } catch (e) {
+      logError(tbl, col, `Comparison failed: ${e.message}`, dt);
+    }
+  }
+}
+return 'Column profiling completed (patched with valid MD5)';
+$$;
+
+
+// STEP 6: EXECUTE THE PROCEDURE
+USE DATABASE SRC_DB;
+USE SCHEMA SRC_SCHEMA;
+CALL SP_COLUMN_PROFILE_MATCH_JS_1240('SRC_DB', 'TGT_DB', 'SRC_SCHEMA', 'TGT_SCHEMA');
+
+// STEP 7: VALIDATE OUTPUT
+// AUDIT RESULTS
+SELECT * FROM SRC_DB.SRC_SCHEMA.COLUMN_PROFILE_AUDIT
+where table_name ='TEST_STR_LEN' ORDER BY TABLE_NAME, COLUMN_NAME;
+
+// ERRORS (if any)
+SELECT * FROM SRC_DB.SRC_SCHEMA.COLUMN_PROFILE_ERRORS ORDER BY ERROR_TS DESC;
